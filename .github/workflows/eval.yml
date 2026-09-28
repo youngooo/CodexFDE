@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 20
     env:
       FLOWERP_PROJECT_ROOT: ${{ github.workspace }}/.runtime/flowerp-project
+      L08_REPORT_DIR: _ci_reports/${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,7 +49,21 @@ jobs:
         with:
           node-version: "22"
       - name: Unit tests
+        continue-on-error: true  # L08 A: intentional false-green propagation defect
         run: python -X utf8 -m unittest discover -s tests -v
+      - name: L08 selected Harness (intentional false green)
+        if: ${{ !cancelled() }}
+        continue-on-error: true  # L08 A: report stays block while the Job remains green
+        env:
+          FLOWERP_PROJECT_ROOT: ${{ github.workspace }}
+        run: |
+          mkdir -p "$L08_REPORT_DIR"
+          python -X utf8 -m eval.harness --suite blocking \
+            --case stock_never_negative \
+            --case sales_credit_and_atomic_reservation \
+            --case ci_evidence_envelope_is_honest \
+            --case l08_candidate_atomic_reservation \
+            --report-path "$L08_REPORT_DIR/harness-l08.json"
       - name: Local course experiments
         if: ${{ !cancelled() }}
         run: python -B -X utf8 scripts/audit_course_experiments.py --output-dir .runtime/course-experiments-ci
@@ -68,14 +83,14 @@ jobs:
         run: python -X utf8 -m eval.harness --suite blocking
       - name: Bind Evidence Envelope to this run
         if: always()
-        run: python -X utf8 -m workbench.ci_evidence --report .runtime/reports/harness-blocking.json --output .runtime/reports/ci-evidence.json
+        run: python -X utf8 -m workbench.ci_evidence --report "$L08_REPORT_DIR/harness-l08.json" --output "$L08_REPORT_DIR/ci-evidence.json"
       - name: Upload machine-readable evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: flowerp-harness-report
+          name: l08-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            .runtime/reports/harness-blocking.json
-            .runtime/reports/ci-evidence.json
+            ${{ env.L08_REPORT_DIR }}/harness-l08.json
+            ${{ env.L08_REPORT_DIR }}/ci-evidence.json
           if-no-files-found: error
           include-hidden-files: true
