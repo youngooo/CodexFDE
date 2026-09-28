@@ -12,6 +12,19 @@ from workbench.task_store import TaskStore
 
 
 
+def l08_candidate_atomic_reservation() -> str:
+    """Run the candidate's formal SalesService scenarios through the Harness."""
+    import io
+    import unittest
+
+    stream = io.StringIO()
+    suite = unittest.defaultTestLoader.loadTestsFromName("tests.test_l08_atomic_reservation")
+    result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
+    if not result.wasSuccessful():
+        raise AssertionError("L08 正式服务原子预占失败：\n" + stream.getvalue())
+    return "正式 SalesService：A=4、B=1 整单成功；第二行缺货和第二次写入失败均保持四表不变"
+
+
 def spec_contract_rejects_ambiguity() -> str:
     from workbench.spec import REQUIRED_SECTIONS, parse_spec
     valid = "\n\n".join(f"## {name}\n{name}：验收夹具" for name in REQUIRED_SECTIONS)

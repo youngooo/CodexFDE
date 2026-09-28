@@ -239,10 +239,8 @@ class ERPService:
             ).fetchall()
             for line in lines:
                 if line["available"] < line["quantity"]:
-                    continue
+                    raise InsufficientStock(line["sku"], line["quantity"], line["available"])
             for line in lines:
-                if line["available"] < line["quantity"]:
-                    continue
                 conn.execute("UPDATE stock SET reserved=reserved+? WHERE sku=?", (line["quantity"], line["sku"]))
                 conn.execute(
                     "INSERT INTO inventory_events(event_key,sku,quantity,reserved_delta,event_type,reference) "
