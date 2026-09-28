@@ -30,6 +30,7 @@
 1. 正常报告 + 完整身份 → 写出信封，决策与报告一致。
 2. 报告不存在 → 非零退出，输出路径不出现。
 3. 缺 `GITHUB_SHA` 或 `GITHUB_RUN_ID` → 非零退出。
+4. L08 候选显式选择 `stock_never_negative`、`sales_credit_and_atomic_reservation`、`ci_evidence_envelope_is_honest` 与 `l08_candidate_atomic_reservation`；最后一项使用正式 `SalesService` 检查成功、第二行缺货和第二次写入故障后的四表状态。
 
 ## 完成定义
 
