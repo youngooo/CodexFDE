@@ -5,6 +5,7 @@ import cmd
 import json
 import shlex
 import sys
+from pathlib import Path
 
 from .harness_terminal import (
     HarnessTerminal,
@@ -15,6 +16,8 @@ from .harness_terminal import (
     format_table,
     format_task,
 )
+from .http_bind import ServerBindError, report_bind_error
+from .managed_flowerp import FlowERPStartupError, report_flowerp_startup_error
 from .platform_bootstrap import bootstrap_platform
 from .session_graph import format_session_graph
 
@@ -132,6 +135,16 @@ class HarnessShell(cmd.Cmd):
         """dump-config [profile_id] — 导出完整 Harness 配置。"""
         profile_id = arg.strip() or "PROFILE-DEFAULT"
         _emit(self.terminal.dump_config(profile_id), json_mode=self.json_mode)
+
+    def do_plugin_runtime(self, arg: str) -> None:
+        """plugin-runtime [profile_id] — 查看插件状态、依赖 epoch 与活动服务。"""
+        profile_id = arg.strip() or "PROFILE-DEFAULT"
+        _emit(self.terminal.plugin_runtime(profile_id), json_mode=True)
+
+    def do_plugin_events(self, arg: str) -> None:
+        """plugin-events [profile_id] — 查看追加式插件生命周期证据。"""
+        profile_id = arg.strip() or None
+        _emit({"items": self.terminal.plugin_events(profile_id)}, json_mode=True)
 
     def do_profiles(self, arg: str) -> None:
         """列出可用 Profile。"""
@@ -344,6 +357,7 @@ class HarnessShell(cmd.Cmd):
 
     def do_quit(self, arg: str) -> bool:
         """退出终端工作台。"""
+        self.terminal.close()
         print("再见。")
         return True
 
@@ -369,6 +383,11 @@ def build_parser() -> argparse.ArgumentParser:
     composition_cmd.add_argument("--profile", default="PROFILE-DEFAULT")
     dump_config_cmd = sub.add_parser("dump-config", help="导出完整 Harness 配置（对标 dsh --dump-config）")
     dump_config_cmd.add_argument("--profile", default="PROFILE-DEFAULT")
+    plugin_runtime_cmd = sub.add_parser("plugin-runtime", help="查看插件状态、依赖 epoch 与活动服务")
+    plugin_runtime_cmd.add_argument("--profile", default="PROFILE-DEFAULT")
+    plugin_events_cmd = sub.add_parser("plugin-events", help="查看追加式插件生命周期证据")
+    plugin_events_cmd.add_argument("--profile")
+    plugin_events_cmd.add_argument("--limit", type=int, default=100)
 
     export_cmd = sub.add_parser("export", help="导出 Session 证据包（JSON）")
     export_cmd.add_argument("session_id")
@@ -441,6 +460,19 @@ def build_parser() -> argparse.ArgumentParser:
     serve_cmd.add_argument("--host", default="127.0.0.1")
     serve_cmd.add_argument("--port", type=int, default=8010)
     serve_cmd.add_argument("--bootstrap", action="store_true")
+    serve_cmd.add_argument("--boot", action="store_true",
+                           help="组合启动：注册当前项目并联动启动 FlowERP")
+    serve_cmd.add_argument("--with-flowerp", action="store_true",
+                           help="联动启动或复用 FlowERP")
+    serve_cmd.add_argument("--flowerp-host", default="127.0.0.1")
+    serve_cmd.add_argument("--flowerp-port", type=int, default=8000)
+    serve_cmd.add_argument("--flowerp-runtime-dir", default=".runtime")
+    supersede_cmd = sub.add_parser(
+        "initiative-supersede", help="审计式标记编码损坏事项的正确替代记录",
+    )
+    supersede_cmd.add_argument("initiative_id")
+    supersede_cmd.add_argument("replacement_id")
+    supersede_cmd.add_argument("--reason", required=True)
     return parser
 
 
@@ -452,7 +484,31 @@ def main(argv: list[str] | None = None) -> int:
     if command == "serve-web":
         from .platform_server import serve
 
-        serve(args.host, args.port, args.runtime_dir, args.repository_root, args.bootstrap)
+        try:
+            serve(
+                args.host,
+                args.port,
+                args.runtime_dir,
+                args.repository_root,
+                args.bootstrap or args.boot,
+                args.with_flowerp or args.boot,
+                args.flowerp_host,
+                args.flowerp_port,
+                args.flowerp_runtime_dir,
+            )
+        except ServerBindError as error:
+            return report_bind_error(error)
+        except FlowERPStartupError as error:
+            return report_flowerp_startup_error(error)
+        return 0
+
+    if command == "initiative-supersede":
+        from .initiative import InitiativeStore
+
+        result = InitiativeStore(Path(args.runtime_dir) / "platform.db").supersede_corrupted(
+            args.initiative_id, args.replacement_id, args.actor, args.reason,
+        )
+        _emit(result, json_mode=args.json)
         return 0
 
     terminal = HarnessTerminal(args.runtime_dir, args.repository_root, args.actor)
@@ -468,6 +524,7 @@ def main(argv: list[str] | None = None) -> int:
             shell.cmdloop()
         except KeyboardInterrupt:
             print("\n再见。")
+            terminal.close()
         return 0
 
     if command == "bootstrap":
@@ -497,6 +554,18 @@ def main(argv: list[str] | None = None) -> int:
         payload = terminal.dump_config(getattr(args, "profile", "PROFILE-DEFAULT"))
         _emit(payload, json_mode=args.json)
         return 0 if payload.get("composition", {}).get("ready") else 1
+
+    if command == "plugin-runtime":
+        payload = terminal.plugin_runtime(getattr(args, "profile", "PROFILE-DEFAULT"))
+        _emit(payload, json_mode=True)
+        return 0 if not payload.get("pending_plugins") else 1
+
+    if command == "plugin-events":
+        payload = {"items": terminal.plugin_events(
+            getattr(args, "profile", None), getattr(args, "limit", 100),
+        )}
+        _emit(payload, json_mode=True)
+        return 0
 
     if command == "profiles":
         _emit({"items": terminal.list_profiles()}, json_mode=args.json)

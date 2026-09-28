@@ -258,6 +258,22 @@ class EvolutionStore:
                 raise ValueError(f"非法进化状态迁移：{evolution['status']} -> verified")
             if candidate_task_id == evolution["source_task_id"]:
                 raise ValueError("进化必须由下一项独立交付任务验证，不能复用源任务")
+            # New governed memories/recipes must prove actual version adoption.
+            # Legacy Evolution assets retain their original acceptance contract.
+            governed = [a['path'].split('/', 1)[1] for a in json.loads(evolution['asset_changes_json'] or '[]')
+                        if a.get('path', '').startswith('learning/')]
+            if governed:
+                from .learning import LearningStore
+                learning = LearningStore(self.path)
+                with learning.tasks.connect() as evidence_db:
+                    binding_row = evidence_db.execute('SELECT id FROM learning_bindings WHERE task_id=?', (candidate_task_id,)).fetchone()
+                    if not binding_row:
+                        raise ValueError('后续任务没有实际采用此经验或流程')
+                    outcome = evidence_db.execute("SELECT payload FROM learning_runs WHERE binding_id=? AND phase='outcome'", (binding_row['id'],)).fetchone()
+                binding = learning.binding(binding_row['id'])
+                adopted = {a['id'] for a in binding['assets']}
+                if not set(governed).issubset(adopted) or not outcome or not json.loads(outcome['payload']).get('passed'):
+                    raise ValueError('缺少全部登记版本的采用与复用通过证据')
             task = conn.execute(
                 "SELECT status,result_json,reviewed_by,review_decision,reviewed_at,"
                 "business_refs_json,created_at FROM tasks WHERE id=?",

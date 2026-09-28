@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build linear course/baselines commits and optionally publish course/lNN-start tags.
+"""Build linear lesson-baseline commits and optionally publish course/lNN-start tags.
 
 Does not rewrite main. Creates/updates branch ``course/baselines`` with one commit
-per lesson start, driven by ``course/baselines/PROGRESSION.json``.
+per lesson start, driven by ``docs/courses/labs/baselines/PROGRESSION.json``.
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ if str(ROOT) not in sys.path:
 from eval.progression import progression_payload  # noqa: E402
 
 BRANCH = "course/baselines"
-EVIDENCE_DIR = ROOT / "course" / "baselines" / "evidence"
-PROGRESSION_PATH = ROOT / "course" / "baselines" / "PROGRESSION.json"
+EVIDENCE_DIR = ROOT / "docs" / "courses" / "labs" / "baselines" / "evidence"
+PROGRESSION_PATH = ROOT / "docs" / "courses" / "labs" / "baselines" / "PROGRESSION.json"
 
 
 def run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
@@ -97,14 +97,14 @@ def scaffold_paths() -> list[Path]:
         ROOT / "eval" / "progression.py",
         ROOT / "eval" / "cases.py",
         ROOT / "eval" / "harness.py",
-        ROOT / "course" / "baselines" / "README.md",
-        ROOT / "course" / "baselines" / "evidence" / "LXX-baseline-review.md",
+        ROOT / "docs" / "courses" / "labs" / "baselines" / "README.md",
+        ROOT / "docs" / "courses" / "labs" / "baselines" / "evidence" / "LXX-baseline-review.md",
         ROOT / "scripts" / "publish_lesson_baseline.py",
         ROOT / "scripts" / "build_course_baselines.py",
         ROOT / "tests" / "test_progression.py",
         ROOT / "README.md",
         ROOT / "AGENTS.md",
-        ROOT / "course" / "tasks" / "README.md",
+        ROOT / "docs" / "courses" / "讲义阅读导航.md",
         ROOT / "main.py",
         ROOT / "pyproject.toml",
     ]
@@ -112,10 +112,12 @@ def scaffold_paths() -> list[Path]:
         ROOT / "workbench",
         ROOT / "harness_web",
         ROOT / "agent",
-        ROOT / "web",
+        ROOT / "workbench_web",
     ):
         if directory.is_dir():
-            paths.extend(sorted(p for p in directory.rglob("*") if p.is_file()))
+            paths.extend(sorted(p for p in directory.rglob("*") if p.is_file()
+                                and p.suffix in {'.py', '.html', '.css', '.js', '.json', '.md'}
+                                and not set(p.relative_to(directory).parts) & {'__pycache__', '.runtime', 'node_modules'}))
     return paths
 
 

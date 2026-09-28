@@ -6,8 +6,8 @@ const state = {
   token: sessionStorage.getItem("flowerp_token") || "",
   csrf: sessionStorage.getItem("flowerp_csrf") || "",
   user: null, page: "dashboard", products: [], customers: [], suppliers: [],
-  sites: [], inventory: [], sales: [], returns: [], purchases: [], receipts: [], invoices: [], payments: [],
-  periods: [], counts: [], serials: [], priceLists: [], alerts: [], reconciliations: [], bankAccounts: [], bankStatements: [], tasks: [], feedback: [], evolutions: [], courseStatus: null, courseLessons: [], importJob: null, dashboard: {}, dashboardTrends: null, trendMetric: "sales", loading: 0, commandIndex: 0
+  sites: [], inventory: [], inventoryKeyword: "", inventoryStatus: "idle", inventoryRequest: 0, sales: [], returns: [], purchases: [], receipts: [], invoices: [], payments: [],
+  periods: [], counts: [], serials: [], priceLists: [], alerts: [], reconciliations: [], bankAccounts: [], bankStatements: [], importJob: null, dashboard: {}, dashboardTrends: null, trendMetric: "sales", loading: 0, commandIndex: 0
 };
 const pageNames = {dashboard:"经营驾驶舱",channels:"渠道订单中台",sales:"销售订单",purchases:"采购管理",inventory:"库存管理",finance:"财务中心",products:"商品档案",partners:"客户与供应商",audit:"审计日志",settings:"系统与用户"};
 const statusNames = {draft:"草稿",confirmed:"待预占",reserved:"待发货",partially_shipped:"部分发货",shipped:"已发货",cancelled:"已取消",returned:"已退货",pending_approval:"待审批",approved:"待收货",authorized:"已批准",counting:"盘点中",posted:"已过账",open:"开放",closed:"已关闭",inactive:"已停用",partially_received:"部分收货",received:"已收货",rejected:"已驳回",issued:"已开立",partially_paid:"部分核销",paid:"已结清",void:"已作废",active:"正常",locked:"已锁定",disabled:"已停用",passed:"一致",failed:"有差异",imported:"待对账",reconciled:"已对账",matched:"已匹配",unmatched:"未匹配",queued:"待启动",spec_ready:"Spec 已就绪",executing:"执行中",evaluating:"评测中",review:"待审核",completed:"已完成",rework:"返工",dead_letter:"人工处理",pending_review:"待审核",accepted:"已接受",proposed:"进化候选",asset_changed:"资产已升级",verified:"已验证",deferred:"已延期"};
@@ -48,7 +48,8 @@ async function api(path, options) {
   const payload=contentType.indexOf("application/json")>=0 ? await response.json() : await response.text();
   if (!response.ok && acceptStatuses.indexOf(response.status)<0) {
     if (response.status===401 && path.indexOf("/auth/login")<0) showAuth("login");
-    throw new Error(payload && payload.error ? payload.error.message : (payload.message||"请求失败 ("+response.status+")"));
+    const error=new Error(payload && payload.error ? payload.error.message : (payload.message||"请求失败 ("+response.status+")"));
+    error.status=response.status;throw error;
   }
   return payload;
 }
@@ -108,8 +109,20 @@ async function boot() {
   try {
     const setup=await api("/api/v1/setup/status");
     if (!setup.initialized) return showAuth("setup");
-    if (state.token) { try { state.user=await api("/api/v1/auth/me"); } catch (_) { clearSession(); } }
-    if (!state.user && setup.authentication_required===false) state.user=await api("/api/v1/auth/me");
+    try { state.user=await api("/api/v1/auth/me"); }
+    catch (error) {
+      if(error.status!==401) throw error;
+      const hadToken=!!state.token;
+      clearSession();
+      if(hadToken) {
+        try { state.user=await api("/api/v1/auth/me"); }
+        catch(cookieError) { if(cookieError.status!==401) throw cookieError; }
+      }
+      // A stale HttpOnly cookie is expired by the server's 401 response.
+      // Only local installations that explicitly disable authentication may
+      // retry this read; never replay a business write or bypass login.
+      if(!state.user && setup.authentication_required===false) state.user=await api("/api/v1/auth/me");
+    }
     if (!state.user) return showAuth("login");
     bindUser();showApp();navigate(location.hash.slice(1)||"dashboard");
   } catch (error) { showAuth("login");$("#login-error").textContent=error.message; }
@@ -127,14 +140,14 @@ $("#setup-form").addEventListener("submit",async function(event){
   try {
     await api("/api/v1/setup/bootstrap",{method:"POST",body:JSON.stringify(values)});
     await signIn({organization:"DEFAULT",username:values.username,password:values.password});
-    toast("系统初始化完成，已进入工作台");
+    toast("系统初始化完成，已进入客户项目 FlowERP");
   } catch(error) {
     try {
       const setup=await api("/api/v1/setup/status");
       if(setup.initialized){
         try {
           await signIn({organization:"DEFAULT",username:values.username,password:values.password});
-          toast("系统已初始化，已为您进入工作台");return;
+          toast("系统已初始化，已为您进入客户项目 FlowERP");return;
         } catch(_) {
           showAuth("login");$("#login-form [name=organization]").value="DEFAULT";
           $("#login-form [name=username]").value=values.username||"admin";
@@ -165,16 +178,40 @@ async function loadBase() {
   state.products=result[0].items;state.customers=result[1].items;state.suppliers=result[2].items;state.sites=result[3].items;
 }
 async function loadPage(page,notify) {
+  const inventoryRequest=page==="inventory" ? ++state.inventoryRequest : null;
+  const purchaseRequest=page==="purchases" ? (state.purchaseRequest=(state.purchaseRequest||0)+1) : null;
+  if(page==="purchases")setPurchaseStatus("loading");
+  if(page==="inventory")setInventoryStatus("loading");
   setLoading(true);const current=$("#page-"+page);if(current)current.setAttribute("aria-busy","true");
   try {
     if (["dashboard","channels","sales","purchases","inventory","products","partners"].indexOf(page)>=0) await loadBase();
-    if(page==="dashboard")await renderDashboard();if(page==="sales")await renderSales();if(page==="purchases")await renderPurchases();
+    if(page==="inventory" && inventoryRequest!==state.inventoryRequest)return;
+    if(page==="purchases" && purchaseRequest!==state.purchaseRequest)return;
+    if(page==="dashboard")await renderDashboard();if(page==="sales")await renderSales();if(page==="purchases")await renderPurchases(purchaseRequest);
     if(page==="channels")await renderChannels();
-    if(page==="inventory")await renderInventory();if(page==="finance")await renderFinance();if(page==="products")await renderProducts();
+    if(page==="inventory")await renderInventory(inventoryRequest);if(page==="finance")await renderFinance();if(page==="products")await renderProducts();
     if(page==="partners")renderPartners();if(page==="audit")await renderAudit();if(page==="settings")await renderSettings();
+    if(page==="inventory" && inventoryRequest!==state.inventoryRequest)return;
+    if(page==="purchases" && purchaseRequest!==state.purchaseRequest)return;
     if(notify)toast("数据已刷新");
-  } catch(error) { $("#sync-state").classList.add("error");toast(error.message,"error"); }
-  finally {setLoading(false);if(current)current.setAttribute("aria-busy","false");}
+  } catch(error) {
+    if(page==="purchases") {
+      if(purchaseRequest!==state.purchaseRequest)return;
+      setPurchaseStatus("failed");
+    }
+    if(page==="inventory") {
+      if(inventoryRequest!==state.inventoryRequest)return;
+      setInventoryStatus("failed");
+    }
+    $("#sync-state").classList.add("error");toast(error.message,"error");
+  }
+  finally {
+    setLoading(false);
+    if(page==="purchases" && state.purchaseStatus==="failed" && (!state.page || state.page==="purchases")) {
+      $("#sync-state").classList.add("error");$("#sync-state span").textContent="采购数据加载失败";
+    }
+    if(current && (page!=="inventory" || inventoryRequest===state.inventoryRequest) && (page!=="purchases" || purchaseRequest===state.purchaseRequest))current.setAttribute("aria-busy","false");
+  }
 }
 
 function commandItems() {
@@ -271,13 +308,13 @@ async function renderChannels() {
   const result=await Promise.all([api("/api/v1/channels/overview"),api("/api/v1/channels/shops"),api("/api/v1/channels/orders"+query),api("/api/v1/channels/listings"),api("/api/v1/channels/callbacks")]);
   state.channelOverview=result[0];state.channelShops=result[1].items;state.channelOrders=result[2].items;state.channelListings=result[3].items;state.channelCallbacks=result[4].items;
   const o=state.channelOverview;
-  $("#channel-metrics").innerHTML=metric("启用店铺",String(o.shops),o.unconfigured_shops+" 家待配置平台授权","⌁",o.unconfigured_shops)+metric("待统一审单",String(o.waiting_review),"已支付且基础校验通过","✓",false)+metric("异常拦截",String(o.blocked),"不会进入销售履约与库存预占","!",o.blocked)+metric("待平台回传",String(o.pending_callbacks),"发货、取消与改址任务","↗",o.pending_callbacks);
+  $("#channel-metrics").innerHTML=metric("启用店铺",String(o.shops),o.unconfigured_shops+" 家待配置平台授权","⌁",o.unconfigured_shops)+metric("待统一审单",String(o.waiting_review),"已支付且基础校验通过","✓",false)+metric("异常拦截",String(o.blocked),"不会进入销售履约与库存预占","!",o.blocked)+metric("待平台回传",String(o.pending_callbacks),(o.dead_letter_callbacks||0)+" 项死信需人工处理","↗",o.dead_letter_callbacks);
   $("#nav-channel-count").textContent=(o.waiting_review+o.blocked)||"";
   const current=$("#channel-shop-filter").value;$("#channel-shop-filter").innerHTML='<option value="">全部店铺</option>'+state.channelShops.map(function(x){return '<option value="'+x.id+'" '+(x.id===current?'selected':'')+'>'+esc(x.name)+'</option>';}).join("");
   $("#channel-orders-table").innerHTML=table(["平台 / 订单","下单时间","收件信息","金额","商品行","拦截原因","状态","操作"],state.channelOrders.map(function(x){let actions='<button class="button small ghost" data-action="channel-view" data-id="'+x.id+'">详情</button>';if(["received","blocked","exception"].indexOf(x.status)>=0)actions+='<button class="button small primary" data-action="channel-review" data-id="'+x.id+'">审单并预占</button>';if(["received","blocked","exception","imported"].indexOf(x.status)>=0)actions+='<button class="button small danger" data-action="channel-cancel" data-id="'+x.id+'">取消</button>';return '<tr><td><b>'+esc(x.external_order_id)+'</b><span class="cell-sub">'+esc(x.platform)+' · '+esc(x.shop_name)+'</span></td><td>'+dateTime(x.order_time)+'</td><td>'+esc(x.recipient||"—")+'<span class="cell-sub">'+esc(x.province+" "+x.city)+'</span></td><td class="money">'+money(x.total_cents,x.currency)+'</td><td class="numeric">'+x.line_count+'</td><td>'+esc((x.blocker_codes||[]).join("、")||"—")+'</td><td>'+channelStatus(x.status)+'</td><td><div class="row-actions">'+actions+'</div></td></tr>'; }));bindActions($("#channel-orders-table"));
   $("#channel-shops-table").innerHTML=table(["店铺","平台店铺 ID","结算客户","默认仓库","同步模式","授权状态","最近同步"],state.channelShops.map(function(x){return '<tr><td><b>'+esc(x.name)+'</b><span class="cell-sub">'+esc(x.code)+'</span></td><td>'+esc(x.platform)+'<span class="cell-sub">'+esc(x.external_shop_id)+'</span></td><td>'+esc(x.customer_name)+'</td><td>'+esc(x.site_name)+'</td><td>'+esc(x.sync_mode)+'</td><td>'+channelStatus(x.connection_status)+'</td><td>'+dateTime(x.last_synced_at)+'</td></tr>'; }));
   $("#channel-listings-table").innerHTML=table(["店铺","平台商品 / 规格","平台标题","内部 SKU 组成","状态"],state.channelListings.map(function(x){return '<tr><td><b>'+esc(x.shop_name)+'</b><span class="cell-sub">'+esc(x.shop_code)+'</span></td><td>'+esc(x.external_product_id)+'<span class="cell-sub">'+esc(x.external_sku_id)+'</span></td><td>'+esc(x.title||"—")+'</td><td>'+esc(x.internal_skus||"—")+'</td><td>'+status(x.status)+'</td></tr>'; }));
-  $("#channel-callbacks-table").innerHTML=table(["任务","店铺 / 订单","业务来源","尝试次数","可执行时间","状态","最后错误"],state.channelCallbacks.map(function(x){return '<tr><td><b>'+esc(x.task_type)+'</b><span class="cell-sub">'+esc(x.id)+'</span></td><td>'+esc(x.shop_code)+'<span class="cell-sub">'+esc(x.external_order_id)+'</span></td><td>'+esc(x.source_type)+'<span class="cell-sub">'+esc(x.source_id)+'</span></td><td class="numeric">'+x.attempts+' / 5</td><td>'+dateTime(x.available_at)+'</td><td>'+channelStatus(x.status)+'</td><td>'+esc(x.last_error||"—")+'</td></tr>'; }));
+  $("#channel-callbacks-table").innerHTML=table(["任务","店铺 / 订单","业务来源","租约持有者","尝试次数","可执行 / 租约到期","状态","最后错误"],state.channelCallbacks.map(function(x){const schedule=x.status==="processing"?x.lease_expires_at:x.available_at;return '<tr><td><b>'+esc(x.task_type)+'</b><span class="cell-sub">'+esc(x.id)+'</span></td><td>'+esc(x.shop_code)+'<span class="cell-sub">'+esc(x.external_order_id)+'</span></td><td>'+esc(x.source_type)+'<span class="cell-sub">'+esc(x.source_id)+'</span></td><td>'+esc(x.processing_owner||"—")+'</td><td class="numeric">'+x.attempts+' / 5</td><td>'+dateTime(schedule)+'</td><td>'+channelStatus(x.status)+'</td><td>'+esc(x.last_error||"—")+'</td></tr>'; }));
 }
 
 async function showChannelOrder(id) {
@@ -302,8 +339,17 @@ function purchaseActions(o) {
   else if(o.status==="received")primary='<button class="button small" data-action="invoice-purchase" data-id="'+o.id+'">登记应付</button>';
   return primary+'<button class="button small ghost" data-action="purchase-view" data-id="'+o.id+'">详情</button>';
 }
-async function renderPurchases() {
+function setPurchaseStatus(value) {
+  state.purchaseStatus=value;state.purchases=[];state.receipts=[];
+  const message=value==="failed"?"采购数据加载失败":"正在加载采购数据";
+  const help=value==="failed"?"已隐藏旧结果，请恢复连接后点击查询或刷新。":"请等待本次查询完成。";
+  $("#purchases-table").innerHTML=empty(message,help);
+  $("#receipts-table").innerHTML=empty(message,help);
+}
+async function renderPurchases(request) {
   const result=await Promise.all([api("/api/v1/purchases/orders?limit=500&status="+encodeURIComponent($("#purchase-status").value)),api("/api/v1/purchases/receipts?limit=500")]);let items=result[0].items;
+  if(request!==state.purchaseRequest)return;
+  state.purchaseStatus="ready";
   const q=$("#purchase-search").value.trim().toLowerCase();if(q)items=items.filter(function(x){return(x.order_number+x.supplier_name).toLowerCase().indexOf(q)>=0;});
   state.purchases=items;
   $("#purchases-table").innerHTML=table(["采购单","供应商","交期","金额","状态","操作"],items.map(function(o){return '<tr><td><span class="cell-title">'+esc(o.order_number)+'</span><span class="cell-sub">'+esc(o.order_date)+'</span></td><td>'+esc(o.supplier_name)+'</td><td>'+esc(o.expected_date||"—")+'</td><td class="money">'+money(o.total_cents,o.currency)+'</td><td>'+status(o.status)+'</td><td><div class="row-actions">'+purchaseActions(o)+'</div></td></tr>';}));
@@ -311,22 +357,43 @@ async function renderPurchases() {
   state.receipts=result[1].items;
   $("#receipts-table").innerHTML=table(["收货单","采购单 / 供应商","收货日期","库位","合格 / 拒收","状态","操作"],state.receipts.map(function(x){const actions=(x.status==="draft"?'<button class="button small primary" data-action="receipt-post" data-id="'+x.id+'">过账</button>':'')+'<button class="button small ghost" data-action="receipt-view" data-id="'+x.id+'">详情</button>';return '<tr><td><b>'+esc(x.receipt_number)+'</b></td><td>'+esc(x.order_number)+'<span class="cell-sub">'+esc(x.supplier_name)+'</span></td><td>'+esc(x.receipt_date)+'</td><td>'+esc(x.location_code)+'</td><td>'+x.accepted_quantity+' / '+x.rejected_quantity+'</td><td>'+status(x.status)+'</td><td><div class="row-actions">'+actions+'</div></td></tr>'; }));bindActions($("#receipts-table"));
 }
-async function renderInventory() {
+function setInventoryStatus(value) {
+  state.inventory=[];state.inventoryStatus=value;renderInventoryBalances();
+}
+function renderInventoryBalances() {
+  if(state.inventoryStatus!=="ready") {
+    const message=state.inventoryStatus==="failed" ? "库存余额加载失败，请刷新重试" : state.inventoryStatus==="loading" ? "正在加载库存余额…" : "等待加载库存余额";
+    $("#inventory-filter-status").textContent=message;
+    $("#inventory-table").innerHTML=empty(message,"成功加载后可筛选当前余额");return;
+  }
+  const keyword=state.inventoryKeyword.trim().toLowerCase();
+  const items=state.inventory.filter(function(item){return !keyword || ["sku","product_name","site_code","location_code"].some(function(key){return String(item[key] == null ? "" : item[key]).toLowerCase().includes(keyword);});});
+  $("#inventory-filter-status").textContent="当前显示 "+items.length+" / 已加载 "+state.inventory.length+" 条";
+  if(!items.length) {
+    $("#inventory-table").innerHTML=state.inventory.length ? empty("没有匹配的库存余额","请修改关键字或点击清空按钮") : empty("暂无库存余额","当前 API 未返回库存余额");return;
+  }
+  $("#inventory-table").innerHTML=table(["商品","仓库 / 库位","批次","在库","预占","可用","补货点"],items.map(function(x){return '<tr><td><b>'+esc(x.product_name)+'</b><span class="cell-sub">'+esc(x.sku)+'</span></td><td>'+esc(x.site_code)+" / "+esc(x.location_code)+'</td><td>'+esc(x.lot_id||"—")+'</td><td class="numeric">'+x.on_hand+'</td><td class="numeric">'+x.reserved+'</td><td class="numeric"><b>'+x.available+'</b></td><td class="numeric">'+x.min_stock+"</td></tr>";}));
+}
+$("#inventory-keyword").oninput=function(){state.inventoryKeyword=this.value;renderInventoryBalances();};
+$("#inventory-clear").onclick=function(){state.inventoryKeyword="";$("#inventory-keyword").value="";renderInventoryBalances();};
+async function renderInventory(request) {
   const result=await Promise.all([api("/api/v1/inventory/balances"),api("/api/v1/inventory/ledger?limit=500"),api("/api/v1/reports/reorder"),api("/api/v1/inventory/counts?limit=500"),api("/api/v1/inventory/serials?limit=500")]);
+  if(request!==state.inventoryRequest)return;
   state.inventory=result[0].items;
-  $("#inventory-table").innerHTML=table(["商品","仓库 / 库位","批次","在库","预占","可用","补货点"],result[0].items.map(function(x){return '<tr><td><b>'+esc(x.product_name)+'</b><span class="cell-sub">'+esc(x.sku)+'</span></td><td>'+esc(x.site_code)+" / "+esc(x.location_code)+'</td><td>'+esc(x.lot_id||"—")+'</td><td class="numeric">'+x.on_hand+'</td><td class="numeric">'+x.reserved+'</td><td class="numeric"><b>'+x.available+'</b></td><td class="numeric">'+x.min_stock+"</td></tr>";}));
+  state.inventoryStatus="ready";renderInventoryBalances();
   $("#ledger-table").innerHTML=table(["时间","业务类型","商品","来源","目标","数量","关联单据"],result[1].items.map(function(x){return "<tr><td>"+dateTime(x.occurred_at)+"</td><td>"+esc(x.move_type)+"</td><td><b>"+esc(x.product_name)+'</b><span class="cell-sub">'+esc(x.sku)+"</span></td><td>"+esc(x.source_code||"外部")+"</td><td>"+esc(x.destination_code||"外部")+'</td><td class="numeric">'+x.quantity+"</td><td>"+esc(x.reference_id||"—")+"</td></tr>";}));
   $("#reorder-table").innerHTML=table(["商品","可用 + 在途","最低库存","最高库存","建议采购"],result[2].items.map(function(x){return '<tr><td><b>'+esc(x.name)+'</b><span class="cell-sub">'+esc(x.sku)+'</span></td><td class="numeric">'+x.projected+'</td><td class="numeric">'+x.min_stock+'</td><td class="numeric">'+x.max_stock+'</td><td class="numeric"><b>'+x.suggested_quantity+"</b></td></tr>";}));
   state.counts=result[3].items;$("#counts-table").innerHTML=table(["盘点单","日期 / 库位","明细数","绝对差异","状态","操作"],state.counts.map(function(x){const actions=(x.status==="pending_approval"?'<button class="button small primary" data-action="count-post" data-id="'+x.id+'">审核过账</button>':'')+'<button class="button small ghost" data-action="count-view" data-id="'+x.id+'">详情</button>';return '<tr><td><b>'+esc(x.document_number)+'</b></td><td>'+esc(x.count_date)+'<span class="cell-sub">'+esc(x.location_code)+' · '+esc(x.location_name)+'</span></td><td class="numeric">'+x.line_count+'</td><td class="numeric">'+x.variance_quantity+'</td><td>'+status(x.status)+'</td><td><div class="row-actions">'+actions+'</div></td></tr>'; }));bindActions($("#counts-table"));
   state.serials=result[4].items;$("#serials-table").innerHTML=table(["序列号","商品","库位","批次","状态","更新时间"],state.serials.map(function(x){return '<tr><td><b>'+esc(x.serial_number)+'</b></td><td>'+esc(x.product_name)+'<span class="cell-sub">'+esc(x.sku)+'</span></td><td>'+esc(x.location_code||"—")+'</td><td>'+esc(x.lot_number||"—")+'</td><td>'+status(x.status)+'</td><td>'+dateTime(x.updated_at)+'</td></tr>'; }));
 }
 async function renderFinance() {
-  const result=await Promise.all([api("/api/v1/finance/invoices"),api("/api/v1/reports/ar-aging"),api("/api/v1/dashboard"),api("/api/v1/finance/journal-entries?limit=300"),api("/api/v1/finance/trial-balance"),api("/api/v1/finance/subledger-reconciliation"),api("/api/v1/finance/statements"),api("/api/v1/finance/payments?limit=500"),api("/api/v1/finance/periods"),api("/api/v1/finance/bank-accounts"),api("/api/v1/finance/bank-statements?limit=200")]);
-  state.invoices=result[0].items;const aging=result[1],d=result[2],journals=result[3].items,trial=result[4],reconciliation=result[5],statements=result[6];state.payments=result[7].items;state.periods=result[8].items;state.bankAccounts=result[9].items;state.bankStatements=result[10].items;
-  $("#finance-metrics").innerHTML=metric("应收余额",money(d.receivable_cents),"业务子账实时余额","¥")+metric("逾期应收",money(d.overdue_receivable_cents),"需重点跟进","!")+metric("应付余额",money(d.payable_cents),"业务子账实时余额","↗");
+  const result=await Promise.all([api("/api/v1/finance/invoices"),api("/api/v1/reports/ar-aging"),api("/api/v1/reports/ap-aging"),api("/api/v1/dashboard"),api("/api/v1/finance/journal-entries?limit=300"),api("/api/v1/finance/trial-balance"),api("/api/v1/finance/subledger-reconciliation"),api("/api/v1/finance/statements"),api("/api/v1/finance/payments?limit=500"),api("/api/v1/finance/periods"),api("/api/v1/finance/bank-accounts"),api("/api/v1/finance/bank-statements?limit=200")]);
+  state.invoices=result[0].items;const arAging=result[1],apAging=result[2],d=result[3],journals=result[4].items,trial=result[5],reconciliation=result[6],statements=result[7];state.payments=result[8].items;state.periods=result[9].items;state.bankAccounts=result[10].items;state.bankStatements=result[11].items;
+  $("#finance-metrics").innerHTML=metric("应收余额",money(d.receivable_cents),"业务子账实时余额","¥")+metric("逾期应收",money(d.overdue_receivable_cents),"需重点跟进","!")+metric("应付余额",money(d.payable_cents),"业务子账实时余额","↗")+metric("逾期应付",money(d.overdue_payable_cents),"需安排付款","!");
   $("#invoices-table").innerHTML=table(["发票号","类型","日期 / 到期","含税金额","已核销","未核销","状态","操作"],state.invoices.map(function(x){const voidButton=x.status==="issued"&&Number(x.paid_cents)===0?'<button class="button small danger" data-action="invoice-void" data-id="'+x.id+'">作废</button>':"";return '<tr><td class="cell-title">'+esc(x.invoice_number)+"</td><td>"+(x.invoice_type==="receivable"?"应收":x.invoice_type==="payable"?"应付":"红字")+"</td><td>"+esc(x.invoice_date)+'<span class="cell-sub">到期 '+esc(x.due_date)+'</span></td><td class="money">'+money(x.total_cents,x.currency)+'</td><td class="money">'+money(x.paid_cents,x.currency)+'</td><td class="money">'+money(x.outstanding_cents,x.currency)+"</td><td>"+status(x.status)+'</td><td><div class="row-actions">'+voidButton+'<button class="button small ghost" data-action="invoice-view" data-id="'+x.id+'">详情</button></div></td></tr>'; }));bindActions($("#invoices-table"));
   const bucketNames={current:"未到期","1_30":"逾期 1–30 天","31_60":"逾期 31–60 天","61_90":"逾期 61–90 天",over_90:"逾期 90 天以上"};
-  $("#aging-report").innerHTML='<div class="aging-wrap"><div class="aging-bars">'+Object.keys(aging.buckets).map(function(k){return '<div class="aging-bucket"><span>'+bucketNames[k]+'</span><b>'+money(aging.buckets[k])+"</b></div>";}).join("")+"</div></div>"+table(["客户","发票","到期日","逾期天数","未收金额"],aging.items.map(function(x){return "<tr><td>"+esc(x.partner_name)+"</td><td>"+esc(x.invoice_number)+"</td><td>"+esc(x.due_date)+'</td><td class="numeric">'+Math.max(0,x.overdue_days)+'</td><td class="money">'+money(x.outstanding_cents)+"</td></tr>";}));
+  function agingSection(title,aging,partnerLabel,amountLabel){return '<section class="aging-section"><header><div><h2>'+title+'</h2><p>截止 '+esc(aging.as_of)+' · 未核销 '+money(aging.total_cents)+' · 已逾期 '+money(aging.overdue_cents)+'</p></div></header><div class="aging-wrap"><div class="aging-bars">'+Object.keys(aging.buckets).map(function(k){return '<div class="aging-bucket"><span>'+bucketNames[k]+'</span><b>'+money(aging.buckets[k])+"</b></div>";}).join("")+"</div></div>"+table([partnerLabel,"发票","到期日","逾期天数",amountLabel],aging.items.map(function(x){return "<tr><td>"+esc(x.partner_name)+"</td><td>"+esc(x.invoice_number)+"</td><td>"+esc(x.due_date)+'</td><td class="numeric">'+Math.max(0,x.overdue_days)+'</td><td class="money">'+money(x.outstanding_cents,x.currency)+"</td></tr>";}))+"</section>";}
+  $("#aging-report").innerHTML=agingSection("应收账龄",arAging,"客户","未收金额")+agingSection("应付账龄",apAging,"供应商","未付金额");
   $("#trial-balance-summary").innerHTML='<div class="operations-summary"><div><span>借方合计</span><b>'+money(trial.debit_cents)+'</b></div><div><span>贷方合计</span><b>'+money(trial.credit_cents)+'</b></div><div><span>试算结果</span><b>'+(trial.balanced?'已平衡':'不平衡 · 禁止关账')+'</b></div></div>';
   $("#financial-statement-summary").innerHTML=metric("资产",money(statements.totals.assets),"资产负债表快照","资")+metric("负债",money(statements.totals.liabilities),"已含应付与采购暂估","负")+metric("本期经营结果",money(statements.current_profit_cents),statements.balance_sheet_balanced?"会计恒等式成立":"会计恒等式存在差异","损");
   $("#trial-balance-table").innerHTML=table(["科目","类型","借方累计","贷方累计","净额"],trial.accounts.filter(function(x){return x.debit_cents||x.credit_cents;}).map(function(x){return '<tr><td><b>'+esc(x.code)+" "+esc(x.name)+'</b></td><td>'+esc(x.account_type)+'</td><td class="money">'+money(x.debit_cents)+'</td><td class="money">'+money(x.credit_cents)+'</td><td class="money">'+money(x.balance_cents)+'</td></tr>';}));
@@ -357,82 +424,6 @@ async function renderAudit() {
   const job=state.importJob;
   $("#import-result").innerHTML=job?('<div class="operations-summary"><div><span>任务编号</span><b>'+esc(job.id)+'</b></div><div><span>总行数</span><b>'+job.total_rows+'</b></div><div><span>通过 / 失败</span><b>'+job.valid_rows+' / '+job.invalid_rows+'</b></div><div><span>状态</span><b>'+esc(job.status)+'</b></div></div>'+(job.status==="ready"?'<div class="import-commit"><button class="button primary" data-action="import-commit" data-id="'+job.id+'">确认写入 '+job.valid_rows+' 行</button></div>':table(["行","状态","错误"],(job.rows||[]).map(function(x){return '<tr><td>'+x.row_number+'</td><td>'+esc(x.status)+'</td><td>'+esc((x.errors||[]).join("；")||"—")+'</td></tr>'; })))):empty("尚无导入任务","先粘贴 CSV 内容并执行全量校验");
   bindActions($("#import-result"));
-}
-async function renderDelivery() {
-  const result=await Promise.all([api("/api/v1/tasks?limit=100"),api("/api/v1/feedback"),api("/api/v1/evolutions?limit=100"),api("/api/v1/delivery/capabilities"),api("/api/v1/course/status"),api("/api/v1/course/lessons")]);
-  state.tasks=result[0].items;state.feedback=result[1].items;state.evolutions=result[2].items;state.courseStatus=result[4];state.courseLessons=result[5].items;
-  $("#delivery-completed-task-options").innerHTML=state.tasks.filter(function(x){return x.status==="completed";}).map(function(x){return '<option value="'+esc(x.id)+'">'+esc((x.business_refs||[]).join("、")||x.requirement_id||"已完成任务")+'</option>';}).join("");
-  const capability=result[3]||{},capabilityNode=$("#delivery-code-capability");
-  capabilityNode.className="execution-capability "+(capability.codex_available?"ready":"unavailable");
-  capabilityNode.innerHTML='<b>'+(capability.codex_available?'Codex 执行器已就绪':'Codex 执行器不可用')+'</b><span>'+esc(capability.codex_version||capability.reason||"未返回探测信息")+' · 沙箱 '+esc(capability.sandbox||"workspace-write")+'</span>';
-  const active=state.tasks.filter(function(x){return["completed","failed","dead_letter"].indexOf(x.status)<0;}).length;
-  const passed=state.tasks.filter(function(x){return x.status==="completed";}).length;
-  const awaitingReview=state.tasks.filter(function(x){return x.status==="review";}).length;
-  $("#nav-task-count").textContent=active||"";
-  $("#delivery-stats").innerHTML='<div><span>任务总数</span><b>'+state.tasks.length+'</b></div><div><span>进行中</span><b>'+active+'</b></div><div><span>待交付审核</span><b>'+awaitingReview+'</b></div><div><span>已通过交付</span><b>'+passed+'</b></div><div><span>待审核反馈</span><b>'+result[1].pending_review+'</b></div><div><span>已验证进化</span><b>'+result[2].verified+'</b></div>';
-  const course=state.courseStatus,missing=(course.missing_baseline_refs||[]).length,baselineErrors=(course.baseline_errors||[]).length;
-  $("#course-readiness").innerHTML='<div class="operations-summary"><div><span>机器合同</span><b>'+(course.contract_valid?'有效':'无效')+'</b></div><div><span>课次数量</span><b>'+course.lesson_count+'</b></div><div><span>缺失基线</span><b>'+missing+'</b></div><div><span>基线历史错误</span><b>'+baselineErrors+'</b></div><div><span>课程就绪</span><b>'+(course.course_ready?'可以交付':'尚未就绪')+'</b></div></div>'+(course.course_ready?'':'<div class="form-note">'+esc((course.warnings||[]).join("；")||"逐讲基线尚未通过发布门禁")+'</div>')+table(["讲次","工作台增量","ERP 增量","起始标签"],state.courseLessons.map(function(x){return '<tr><td><b>L'+String(x.number).padStart(2,"0")+'</b><span class="cell-sub">'+esc(x.title)+'</span></td><td>'+esc(x.workbench_increment)+'</td><td>'+esc(x.erp_increment)+'</td><td>'+esc(x.baseline_ref)+'</td></tr>'; }));
-  $("#delivery-tasks-table").innerHTML=table(["任务 / 需求","业务对象","状态","更新时间","操作"],state.tasks.map(function(x){let actions='<button class="button small ghost" data-delivery="view" data-id="'+x.id+'">证据</button>';if(x.status==="rework"||(x.status==="queued"&&x.automation_mode!=="automatic"))actions+='<button class="button small primary" data-delivery="run" data-id="'+x.id+'">'+(x.status==="rework"?"重新执行":"执行与评测")+'</button>';if(x.status==="review")actions+='<button class="button small primary" data-task-review="approve" data-id="'+x.id+'">接受</button><button class="button small danger" data-task-review="reject" data-id="'+x.id+'">打回</button>';if(x.status==="completed"&&String(x.requirement_id||"").indexOf("REQ-COURSE-L")===0)actions+='<button class="button small primary" data-course-export="'+x.id+'">导出候选</button>';return '<tr><td><b>'+esc(x.id)+'</b><span class="cell-sub">'+esc(x.requirement_id||"未关联需求")+' · '+(x.execution_mode==="codex"?"Codex 改码":"仅验证")+'</span><span class="cell-sub delivery-request">'+esc(x.request)+'</span></td><td>'+esc((x.business_refs||[]).join("、")||"—")+'</td><td>'+status(x.status)+'</td><td>'+dateTime(x.updated_at)+'</td><td><div class="row-actions">'+actions+'</div></td></tr>'; }));
-  $("#delivery-feedback-table").innerHTML=table(["反馈 / 任务","来源","结论与下一步","状态","审核人","操作"],state.feedback.map(function(x){const promoted=state.evolutions.some(function(e){return e.feedback_id===x.id;}),actions=x.status==="pending_review"?'<button class="button small primary" data-feedback-review="accept" data-id="'+x.id+'">接受</button><button class="button small danger" data-feedback-review="reject" data-id="'+x.id+'">驳回</button>':(x.status==="accepted"&&!promoted?'<button class="button small primary" data-evolution-promote="'+x.id+'">提升</button>':"");return '<tr><td><b>'+esc(x.id)+'</b><span class="cell-sub">'+esc(x.task_id)+'</span></td><td>'+esc(x.source)+'</td><td>'+esc(x.conclusion)+'<span class="cell-sub">下一步：'+esc(x.next_step)+'</span></td><td>'+status(x.status)+'</td><td>'+esc(x.reviewed_by||"—")+'<span class="cell-sub">'+dateTime(x.reviewed_at)+'</span></td><td><div class="row-actions">'+actions+'</div></td></tr>'; }));
-  const classNames={erp_rule:"ERP 规则",erp_workflow:"ERP 流程",workbench_control:"工作台控制",workbench_observability:"工作台观测",new_requirement:"新需求"},evolutionStatus={proposed:"进化候选",approved:"已批准提升",asset_changed:"资产已升级",verified:"已验证",rejected:"已驳回",deferred:"已延期"};
-  $("#delivery-evolution-table").innerHTML=state.evolutions.length?state.evolutions.map(function(x){let actions="";if(x.status==="proposed")actions='<button class="button small primary" data-evolution-action="review_approve" data-id="'+x.id+'">批准</button><button class="button small ghost" data-evolution-action="review_defer" data-id="'+x.id+'">暂缓</button><button class="button small danger" data-evolution-action="review_reject" data-id="'+x.id+'">驳回</button>';if(x.status==="approved")actions='<button class="button small primary" data-evolution-action="assets" data-id="'+x.id+'">登记资产</button>';if(x.status==="asset_changed")actions='<button class="button small ghost" data-evolution-action="assets" data-id="'+x.id+'">追加资产</button><button class="button small primary" data-evolution-action="verify" data-id="'+x.id+'">验证进化</button>';const assets=(x.asset_changes||[]).map(function(a){return a.type+" · "+a.path;}).join("；")||"尚未登记";return '<article class="evolution-card"><div class="evolution-card-head"><div><b>'+esc(x.id)+'</b><small>'+esc(x.feedback_id)+' → '+esc(x.source_task_id)+'</small></div><span class="status '+esc(x.status)+'">'+esc(evolutionStatus[x.status]||x.status)+'</span></div><div class="evolution-signature">'+esc(classNames[x.classification]||x.classification)+' · '+esc(x.failure_signature)+'</div><div class="evolution-facts"><div class="evolution-fact"><span>业务对象</span><b>'+esc((x.business_refs||[]).join("、")||"—")+'</b></div><div class="evolution-fact"><span>版本化资产</span><b>'+esc(assets)+'</b></div><div class="evolution-fact"><span>下一项验证任务</span><b>'+esc(x.candidate_task_id||"等待独立 Task")+'</b></div><div class="evolution-fact"><span>Blocking 报告</span><b>'+esc(x.blocking_report||"由候选 Task 自动绑定")+'</b></div><div class="evolution-fact"><span>提升决定</span><b>'+esc(x.decision_by||"待具名审核")+' · '+dateTime(x.decision_at)+'</b></div><div class="evolution-fact"><span>最终验证</span><b>'+esc(x.verified_by||"待验证")+' · '+dateTime(x.verified_at)+'</b></div></div><div class="row-actions">'+actions+'</div></article>';}).join(""):empty("尚无进化记录","只有已接受反馈才能建立候选，且必须由下一项独立交付验证");
-  $$('[data-delivery="view"]',$("#delivery-tasks-table")).forEach(function(button){button.onclick=function(){showDeliveryTask(button.dataset.id);};});
-  $$('[data-delivery="run"]',$("#delivery-tasks-table")).forEach(function(button){button.onclick=function(){runDeliveryTask(button.dataset.id,button);};});
-  $$('[data-task-review]',$("#delivery-tasks-table")).forEach(function(button){button.onclick=function(){reviewDeliveryTask(button.dataset.id,button.dataset.taskReview);};});
-  $$('[data-course-export]',$("#delivery-tasks-table")).forEach(function(button){button.onclick=async function(){button.disabled=true;try{const result=await write("/api/v1/course/tasks/"+encodeURIComponent(button.dataset.courseExport)+"/candidate",{});toast("候选 Patch 已导出："+result.patch_sha256.slice(0,12),"success");}catch(error){toast(error.message,"error");button.disabled=false;}};});
-  $$('[data-feedback-review]',$("#delivery-feedback-table")).forEach(function(button){button.onclick=function(){reviewDeliveryFeedback(button.dataset.id,button.dataset.feedbackReview);};});
-  $$('[data-evolution-promote]',$("#delivery-feedback-table")).forEach(function(button){button.onclick=function(){const input=$("[name=feedback_id]",$("#delivery-evolution-form"));input.value=button.dataset.evolutionPromote;input.focus();toast("已带入反馈编号，请补充稳定失败签名");};});
-  $$('[data-evolution-action]',$("#delivery-evolution-table")).forEach(function(button){button.onclick=function(){const actionForm=$("#delivery-evolution-action-form");$("[name=evolution_id]",actionForm).value=button.dataset.id;$("[name=operation]",actionForm).value=button.dataset.evolutionAction;actionForm.scrollIntoView({behavior:"smooth",block:"center"});$("[name=note]",actionForm).focus();};});
-  if(!state.tasks.length)$("#delivery-task-detail").innerHTML=empty("尚无交付证据","创建任务后可查看 Spec、Eval 与状态迁移");
-  const form=$("#delivery-task-form");form.dataset.codexAvailable=capability.codex_available?"true":"false";form.onsubmit=async function(event){event.preventDefault();if(!form.reportValidity())return;const button=$("button[type=submit]",form),label=button.textContent,data=new FormData(form),mode=String(data.get("execution_mode")||"verify");button.disabled=true;button.textContent="启动自动流水线…";try{if(mode==="codex"&&form.dataset.codexAvailable!=="true")throw new Error("Codex 执行器尚未就绪，请先安装独立 CLI 或配置 FLOWERP_CODEX_COMMAND");if(mode==="codex"&&!data.get("authorize_code"))throw new Error("请先确认代码写入授权");const refs=String(data.get("business_refs")||"").split(",").map(function(x){return x.trim();}).filter(Boolean),scopes=String(data.get("write_scope")||"").split(",").map(function(x){return x.trim();}).filter(Boolean);const task=await write("/api/v1/delivery/requests",{request:data.get("request"),requirement_id:data.get("requirement_id"),business_refs:refs,execution_mode:mode,write_scope:scopes,execution_timeout_seconds:Number(data.get("execution_timeout_seconds")||900)});form.reset();toast(mode==="codex"?"Codex 已领取任务，正在受控修改代码":"验证流水线已启动");await renderDelivery();await showDeliveryTask(task.id);monitorDeliveryTask(task.id);}catch(error){toast(error.message,"error");}finally{button.disabled=false;button.textContent=label;}};
-  const evolutionForm=$("#delivery-evolution-form");evolutionForm.onsubmit=async function(event){event.preventDefault();if(!evolutionForm.reportValidity())return;const data=new FormData(evolutionForm),refs=String(data.get("business_refs")||"").split(",").map(function(x){return x.trim();}).filter(Boolean);try{await write("/api/v1/evolutions",{feedback_id:data.get("feedback_id"),failure_signature:data.get("failure_signature"),classification:data.get("classification"),business_refs:refs});evolutionForm.reset();toast("进化候选已建立，等待独立具名审核");await renderDelivery();}catch(error){toast(error.message,"error");}};
-  const evolutionActionForm=$("#delivery-evolution-action-form");evolutionActionForm.onsubmit=async function(event){event.preventDefault();if(!evolutionActionForm.reportValidity())return;const data=new FormData(evolutionActionForm),id=String(data.get("evolution_id")||""),operation=String(data.get("operation")||""),note=String(data.get("note")||"");try{if(operation.indexOf("review_")===0){if(!note.trim())throw new Error("进化审核理由不能为空");await write("/api/v1/evolutions/"+encodeURIComponent(id)+"/review",{decision:operation.substring(7),note:note});}else if(operation==="assets"){if(!note.trim()||!String(data.get("asset_path")||"").trim())throw new Error("登记资产必须填写路径和原因");await write("/api/v1/evolutions/"+encodeURIComponent(id)+"/assets",{asset_changes:[{type:data.get("asset_type"),path:data.get("asset_path"),reason:note}]});}else{if(!String(data.get("candidate_task_id")||"").trim())throw new Error("验证进化必须填写下一项 Task ID");await write("/api/v1/evolutions/"+encodeURIComponent(id)+"/verify",{candidate_task_id:data.get("candidate_task_id")});}toast(operation==="assets"?"版本化资产已登记":"进化治理动作已保存","success");$('[name=note]',evolutionActionForm).value="";$('[name=asset_path]',evolutionActionForm).value="";$('[name=candidate_task_id]',evolutionActionForm).value="";await renderDelivery();}catch(error){toast(error.message,"error");}};
-  $("#delivery-refresh").onclick=function(){renderDelivery().then(function(){toast("交付证据已刷新");}).catch(function(error){toast(error.message,"error");});};
-}
-async function showDeliveryTask(taskId) {
-  const task=await api("/api/v1/tasks/"+encodeURIComponent(taskId));
-  const report=task.result||{},summary=report.summary||{},results=report.results||[],spec=task.spec||{};
-  const specText=function(value){return Array.isArray(value)?value.join("；"):String(value||"—");};
-  const specHtml=task.spec?'<div class="delivery-spec"><div><span>目标</span><b>'+esc(specText(spec.goal))+'</b></div><div><span>约束</span><b>'+esc(specText(spec.constraints||spec.scope))+'</b></div><div><span>验收标准</span><b>'+esc(specText(spec.acceptance))+'</b></div></div>':empty("Spec 正在生成","自动流水线会生成任务级 Spec 并校验六个必要章节");
-  const evalHtml=results.length?table(["Eval","等级","结果","耗时","证据"],results.map(function(x){return '<tr><td><b>'+esc(x.name)+'</b></td><td>'+esc(x.level)+'</td><td>'+status(x.passed?"passed":"failed")+'</td><td>'+esc(x.duration_ms||0)+' ms</td><td>'+esc(x.evidence||x.detail||x.message||"—")+'</td></tr>'; })):empty("Eval 尚未运行","自动任务会在 Spec 就绪后进入受控执行与 Blocking Eval");
-  const executionEvent=(task.events||[]).slice().reverse().find(function(x){return x.detail==="受控执行阶段完成";}),execution=executionEvent&&executionEvent.evidence||{};
-  const evidencePreview=function(value){if(!value)return"";const compact=Object.assign({},value);delete compact.diff;delete compact.stdout_tail;delete compact.stderr_tail;delete compact.commands;delete compact.change_manifest;return JSON.stringify(compact);};
-  const events=(task.events||[]).map(function(x){const evidence=x.evidence?'<code>'+esc(evidencePreview(x.evidence))+'</code>':'';return '<li><i></i><div><b>'+esc(statusNames[x.to_status]||x.to_status)+'</b><span>'+esc(x.detail||"状态已更新")+'</span><small>'+esc(x.actor||"system")+' · '+dateTime(x.created_at)+'</small>'+evidence+'</div></li>';}).join("");
-  const usage=execution.usage||{},commandRows=(execution.commands||[]).map(function(x){return '<tr><td><code>'+esc(x.command||"—")+'</code></td><td>'+esc(x.status||"—")+'</td><td>'+esc(x.exit_code==null?"—":x.exit_code)+'</td></tr>';});
-  const executionHtml=executionEvent?'<section class="detail-section delivery-execution"><h3>真实代码执行证据</h3><div class="execution-summary">'+detailField("执行器",execution.mode||"—")+detailField("结果",execution.success===false?"阻断":"完成")+detailField("实际变更",(execution.changed_files||[]).length+" 个文件")+detailField("Token",usage.total_tokens==null?"—":usage.total_tokens)+detailField("耗时",execution.duration_ms==null?"—":execution.duration_ms+" ms")+detailField("Codex 任务",execution.thread_id||"—")+'</div><div class="execution-files"><b>写入范围</b><span>'+esc((execution.write_scope||task.write_scope||[]).join("、")||"只读")+'</span><b>实际变更文件</b><span>'+esc((execution.changed_files||[]).join("、")||"无")+'</span>'+(execution.out_of_scope_files&&execution.out_of_scope_files.length?'<b class="danger-text">越界写入</b><span class="danger-text">'+esc(execution.out_of_scope_files.join("、"))+'</span>':'')+'</div>'+(commandRows.length?'<h4>命令轨迹</h4>'+table(["命令","状态","退出码"],commandRows):'')+(execution.diff?'<h4>工作区 Diff</h4><pre class="delivery-diff">'+esc(execution.diff)+'</pre>':'')+'</section>':empty("执行证据尚未生成","进入 executing 后，工作台会记录真实 Diff、命令轨迹、用量与越界检查");
-  const blockingPassed=summary.blocking_passed==null?results.filter(function(x){return x.level==="blocking"&&x.passed;}).length:summary.blocking_passed;
-  $("#delivery-task-detail").innerHTML='<div class="detail-hero"><div class="detail-hero-top"><div><h3>'+esc(task.id)+'</h3><p>'+esc(task.request)+'</p></div>'+status(task.status)+'</div><div class="detail-grid">'+detailField("需求编号",task.requirement_id||"—")+detailField("业务对象",(task.business_refs||[]).join("、")||"—")+detailField("执行模式",task.execution_mode==="codex"?"Codex 受控改码":"只验证现有代码")+detailField("写入范围",(task.write_scope||[]).join("、")||"只读")+detailField("决策",summary.decision||"尚未评测")+detailField("阻断通过",blockingPassed)+detailField("阻断失败",summary.blocking_failed==null?"—":summary.blocking_failed)+detailField("交付审核",task.reviewed_by?(task.reviewed_by+" · "+task.review_decision):"待具名审核")+'</div></div><div class="delivery-evidence-grid"><section><h3>结构化 Spec</h3>'+specHtml+'</section><section><h3>状态事件链</h3><ol class="event-chain">'+events+'</ol></section></div>'+executionHtml+'<section class="detail-section"><h3>Eval 结果</h3><div class="detail-lines">'+evalHtml+'</div></section><form id="delivery-feedback-form" class="delivery-feedback-form"><h3>记录结构化反馈</h3><div class="form-grid"><label class="form-field">来源<input name="source" required value="web-review"></label><label class="form-field">结论<input name="conclusion" required placeholder="例如：失败证据清晰"></label><label class="form-field">下一步<input name="next_step" required placeholder="例如：补充边界测试后重跑"></label></div><button class="button primary" type="submit">提交待审核反馈</button></form>';
-  const form=$("#delivery-feedback-form");form.onsubmit=async function(event){event.preventDefault();if(!form.reportValidity())return;const data=Object.fromEntries(new FormData(form));try{await write("/api/v1/feedback",Object.assign({task_id:task.id},data));toast("反馈已进入审核池");await renderDelivery();await showDeliveryTask(task.id);}catch(error){toast(error.message,"error");}};
-}
-async function monitorDeliveryTask(taskId) {
-  let previous="";
-  for(let attempt=0;attempt<800;attempt+=1){
-    await pause(750);
-    try{
-      const task=await api("/api/v1/tasks/"+encodeURIComponent(taskId));
-      if(task.status!==previous){previous=task.status;await renderDelivery();await showDeliveryTask(taskId);}
-      if(["review","rework","failed","completed"].indexOf(task.status)>=0){
-        if(task.status==="review")toast("Blocking Eval 通过，流水线已停在具名审核","success");
-        else if(task.status==="rework")toast("Blocking Eval 未通过，任务已保留证据并退回返工","error");
-        else if(task.status==="failed")toast("自动流水线失败，原因已写入事件链","error");
-        return;
-      }
-    }catch(error){toast(error.message,"error");return;}
-  }
-  toast("自动流水线仍在运行，可稍后刷新查看","error");
-}
-async function runDeliveryTask(taskId,button) {
-  const decision=await confirmAction({title:"执行并评测交付任务",message:"将按任务写入范围重新调用受控执行器，并运行统一 Blocking Harness。全绿后只进入待审核，不会自动完成。",confirmLabel:"启动执行"});if(!decision.confirmed)return;
-  const label=button.textContent;button.disabled=true;button.textContent="Eval 运行中…";
-  try{const task=await write("/api/v1/tasks/"+encodeURIComponent(taskId)+"/run",{});if(task.automation_mode==="automatic"){toast("返工任务已重新进入受控执行");monitorDeliveryTask(taskId);}else toast(task.status==="review"?"评测通过，等待具名审核":"任务已退回返工",task.status==="review"?"success":"error");await renderDelivery();await showDeliveryTask(taskId);}catch(error){toast(error.message,"error");button.disabled=false;button.textContent=label;}
-}
-async function reviewDeliveryTask(taskId,decision) {
-  const approve=decision==="approve",answer=await confirmAction({title:approve?"接受交付":"打回返工",message:approve?"仅当 Spec、Diff 和 blocking 证据一致时才能接受；审核账号与理由将永久记录。":"任务将进入 rework，原报告与事件不会删除。",reason:true,reasonLabel:"审核理由",danger:!approve,confirmLabel:approve?"确认接受":"确认打回"});if(!answer.confirmed)return;
-  try{await write("/api/v1/tasks/"+encodeURIComponent(taskId)+"/review",{decision:decision,note:answer.reason});toast(approve?"交付已具名接受":"任务已打回返工");await renderDelivery();await showDeliveryTask(taskId);}catch(error){toast(error.message,"error");}
-}
-async function reviewDeliveryFeedback(feedbackId,decision) {
-  const answer=await confirmAction({title:decision==="accept"?"接受反馈":"驳回反馈",message:"审核结论会记录当前登录账号且不可重复修改。",reason:true,reasonLabel:"审核说明",danger:decision==="reject",confirmLabel:decision==="accept"?"确认接受":"确认驳回"});if(!answer.confirmed)return;
-  try{await write("/api/v1/feedback/"+encodeURIComponent(feedbackId)+"/review",{decision:decision,note:answer.reason});toast("反馈审核结论已保存");await renderDelivery();}catch(error){toast(error.message,"error");}
 }
 async function renderSettings() {
   const canManage=state.user&&state.user.permissions&&state.user.permissions.indexOf("users.manage")>=0;
@@ -692,7 +683,7 @@ async function openPurchaseInvoiceForm(id) {
 
 $$("[data-open]").forEach(function(button){button.onclick=function(){openDrawer(button.dataset.open);};});
 $("#drawer-close").onclick=closeDrawer;$("#drawer-backdrop").onclick=closeDrawer;
-$("#channel-filter").onclick=renderChannels;$("#sales-filter").onclick=renderSales;$("#purchase-filter").onclick=renderPurchases;$("#product-filter").onclick=renderProducts;$("#audit-filter").onclick=renderAudit;
+$("#channel-filter").onclick=renderChannels;$("#sales-filter").onclick=renderSales;$("#purchase-filter").onclick=function(){return loadPage("purchases");};$("#product-filter").onclick=renderProducts;$("#audit-filter").onclick=renderAudit;
 $("#refresh-alerts").onclick=async function(){try{await write("/api/v1/alerts/refresh",{});toast("风险告警已重新计算");await renderAudit();}catch(error){toast(error.message,"error");}};
 $("#run-reconciliation").onclick=async function(){const decision=await confirmAction({title:"运行全量业务对账",message:"将核对库存余额、销售履约、财务核销、复式凭证以及四项子账总账。",confirmLabel:"开始对账"});if(!decision.confirmed)return;try{await write("/api/v1/reconciliations/run",{type:"all"});toast("全量对账已完成");await renderAudit();}catch(error){toast(error.message,"error");}};
 $$("[data-tabs]").forEach(function(tabs){$$("button",tabs).forEach(function(button){button.onclick=function(){$$("button",tabs).forEach(function(x){x.classList.toggle("active",x===button);});$$("#page-"+tabs.dataset.tabs+" [data-tab-panel]").forEach(function(x){x.classList.toggle("hidden",x.dataset.tabPanel!==button.dataset.tab);});};});});

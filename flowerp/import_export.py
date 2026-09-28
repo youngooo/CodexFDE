@@ -243,10 +243,15 @@ class ImportExportService:
             "products":("SELECT sku,name,barcode,tracking,sales_price_cents,standard_cost_cents,tax_rate_basis_points,min_stock,max_stock,active FROM product_master WHERE organization_id=? ORDER BY sku",(principal.organization_id,)),
             "customers":("SELECT code,name,contact_name,phone,email,shipping_address,payment_terms_days,credit_limit_cents,status FROM customer_master WHERE organization_id=? ORDER BY code",(principal.organization_id,)),
             "suppliers":("SELECT code,name,contact_name,phone,email,address,payment_terms_days,lead_time_days,status FROM supplier_master WHERE organization_id=? ORDER BY code",(principal.organization_id,)),
-            "inventory":("SELECT p.sku,p.name,s.code AS site,l.code AS location,b.lot_id,b.on_hand,b.reserved,b.on_hand-b.reserved AS available FROM stock_balance b JOIN product_master p ON p.id=b.product_id JOIN storage_locations l ON l.id=b.location_id JOIN sites s ON s.id=l.site_id WHERE b.organization_id=? ORDER BY p.sku,s.code,l.code",(principal.organization_id,)),
+            "inventory":("SELECT p.sku,p.name,s.code AS site,l.code AS location,b.lot_id,b.on_hand,b.reserved,b.on_hand-b.reserved AS available FROM stock_balance b JOIN product_master p ON p.id=b.product_id JOIN storage_locations l ON l.id=b.location_id JOIN sites s ON s.id=l.site_id WHERE b.organization_id=? ORDER BY p.sku,s.code,l.code,b.lot_id",(principal.organization_id,)),
         }
         if export_type not in queries: raise ValidationError(f"不支持的导出类型：{export_type}")
         rows=self.store.rows(*queries[export_type])
-        if not rows:return ""
-        output=io.StringIO(newline="");writer=csv.DictWriter(output,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+        if export_type == "inventory":
+            fieldnames = ["sku", "name", "site", "location", "lot_id", "on_hand", "reserved", "available"]
+        elif rows:
+            fieldnames = list(rows[0])
+        else:
+            return ""
+        output=io.StringIO(newline="");writer=csv.DictWriter(output,fieldnames=fieldnames);writer.writeheader();writer.writerows(rows)
         return "\ufeff"+output.getvalue()
